@@ -1,7 +1,6 @@
 #include "cudaproj.h"
 
 void resize_some_images() {
-
     string source_filename = "image.tiff";
     string result_filename = "result.tiff";
     image_info img = get_raster(source_filename.c_str());
