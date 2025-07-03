@@ -1,83 +1,118 @@
 #include "cudaproj.h"
 
-void create_raster(const char* filename, image_info image) {
-    vector<utype*> bands = image.bands;
-    size_t width = image.width;
-    size_t height = image.height;
-    size_t bands_count = bands.size();
-    GDALDatasetH dataset = GDALCreate(GDALGetDriverByName("GTiff"), filename, width, height, bands_count, GDT_Type, NULL);
-    if (dataset == NULL) {
-        cout << "Error while creating file\n";
-        return;
+//matrix[x][y] == matrix[x * width + y]
+
+__global__ void copy_nearest_pixel(utype* source_matrix, size_t old_height, size_t old_width, utype* result_matrix, size_t height, size_t width) {
+    size_t current_x = blockIdx.x;
+    size_t pixels_per_thread = (width + blockDim.x - 1) / blockDim.x;
+    size_t start_y = pixels_per_thread * threadIdx.x;
+    size_t end_y = start_y + pixels_per_thread;
+    if (end_y > width) {
+        end_y = width;
     }
-    // bands are really numbered from 1
-    // pretty dumb
-    for (size_t i = 1; i <= bands_count; ++i) {
-        GDALRasterBandH band = GDALGetRasterBand(dataset, i);
-        GDALRasterIO(band, GF_Write, 0, 0, width, height, image.bands[i - 1], width, height, GDT_Type, 0, 0);
+    for (size_t current_y = start_y; current_y < end_y; ++current_y) {
+        // i need to find nearest pixel in old matrix
+        size_t old_x = current_x * old_height / height;
+        size_t old_y = current_y * old_width / width;
+        result_matrix[current_x * width + current_y] = source_matrix[old_x * old_width + old_y];
     }
-    GDALClose(dataset);
 }
 
-void print_dataset_info(GDALDataset* dataset) {
-    if (dataset == nullptr) {
-        std::cerr << "Error: dataset pointer is nullptr." << std::endl;
-        return;
+void resize_matrix_nearest(utype* matrix, size_t height, size_t width, utype* result_matrix, size_t desired_height, size_t desired_width) {
+    chrono::milliseconds start_time = chrono::duration_cast<chrono::milliseconds>(
+        chrono::steady_clock::now().time_since_epoch());
+    utype* source_matrix_gpu;
+    cudaMalloc(&source_matrix_gpu, height * width * sizeof(utype));
+    cudaMemcpy(source_matrix_gpu, matrix, height * width * sizeof(utype), cudaMemcpyHostToDevice);
+
+    utype* result_matrix_gpu;
+    cudaMalloc(&result_matrix_gpu, desired_height * desired_width * sizeof(utype));
+
+    chrono::milliseconds start_time_gpu = chrono::duration_cast<chrono::milliseconds>(
+        chrono::steady_clock::now().time_since_epoch());
+    size_t threads_per_block = min((size_t)128, desired_width);
+    copy_nearest_pixel<<<desired_height, threads_per_block>>>(source_matrix_gpu, height, width, result_matrix_gpu, desired_height, desired_width);
+    chrono::milliseconds end_time_gpu = chrono::duration_cast<chrono::milliseconds>(
+        chrono::steady_clock::now().time_since_epoch());
+    cout << "gpu part nearest value interpolation time: " << (end_time_gpu - start_time_gpu).count() << '\n';
+
+    cudaMemcpy(result_matrix, result_matrix_gpu, desired_height * desired_width * sizeof(utype), cudaMemcpyDeviceToHost);
+
+    cudaFree(source_matrix_gpu);
+    cudaFree(result_matrix_gpu);
+    chrono::milliseconds end_time = chrono::duration_cast<chrono::milliseconds>(
+        chrono::steady_clock::now().time_since_epoch());
+    cout << "whole nearest value interpolation time: " << (end_time - start_time).count() << '\n';
+}
+
+// let us now function at 4 points
+// f(x1, y1) = q11
+// f(x2, y1) = q21
+// f(x1, y2) = q12
+// f(x2, y2) = q22
+// x1 < x < x2 and y1 < y < y2
+// and we want to compute f(x, y)
+// f(x, y1) = (x2 - x)/(x2 - x1) * q11 + (x - x1)/(x2 - x1) * q21
+// f(x, y2) = (x2 - x)/(x2 - x1) * q12 + (x - x1)/(x2 - x1) * q22
+// f(x, y) = (y2 - y)/(y2 - y1) * f(x, y1) + (y - y1)/(y2 - y1) * f(x, y2)
+
+__global__ void bilinear(utype* source_matrix, size_t old_height, size_t old_width, utype* result_matrix, size_t height, size_t width) {
+    size_t current_x = blockIdx.x;
+    size_t pixels_per_thread = (width + blockDim.x - 1) / blockDim.x;
+    size_t start_y = pixels_per_thread * threadIdx.x;
+    size_t end_y = start_y + pixels_per_thread;
+    if (end_y > width) {
+        end_y = width;
     }
-
-    // Get the number of raster bands
-    int bandCount = dataset->GetRasterCount();
-    std::cout << "Number of bands: " << bandCount << std::endl;
-
-    // Get the size of the image
-    int width = dataset->GetRasterXSize();
-    int height = dataset->GetRasterYSize();
-    std::cout << "Image size: " << width << " x " << height << std::endl;
-
-    // Get information about each band
-    for (int i = 1; i <= bandCount; ++i) {
-        GDALRasterBand* band = dataset->GetRasterBand(i);
-        if (band) {
-            std::cout << "Band " << i << ":" << std::endl;
-            std::cout << "  Data type: " << GDALGetDataTypeName(band->GetRasterDataType()) << std::endl;
-            std::cout << "  Minimum value: " << band->GetMinimum(nullptr) << std::endl;
-            std::cout << "  Maximum value: " << band->GetMaximum(nullptr) << std::endl;
+    for (size_t current_y = start_y; current_y < end_y; ++current_y) {
+        // i need to find nearest pixel in old matrix
+        size_t old_x = current_x * old_height / height;
+        size_t old_y = current_y * old_width / width;
+        if (old_x + 1 == old_height || old_y + 1 == old_width) {
+            // edge point
+            // result_matrix[current_x * width + current_y] = source_matrix[old_x * old_width + old_y];
+            result_matrix[current_x * width + current_y] = 0;
+            continue;
         }
-    }
-
-    // Get geotransform information
-    double geoTransform[6];
-    if (dataset->GetGeoTransform(geoTransform) == CE_None) {
-        std::cout << "Geotransform:" << std::endl;
-        std::cout << "  X: " << geoTransform[0] << std::endl;
-        std::cout << "  Y: " << geoTransform[3] << std::endl;
-        std::cout << "  Pixel width: " << geoTransform[1] << std::endl;
-        std::cout << "  Pixel height: " << geoTransform[5] << std::endl;
-    } else {
-        std::cout << "Geotransform not available." << std::endl;
+        double x1 = old_x;
+        double y1 = old_y;
+        double x2 = x1 + 1;
+        double y2 = y1 + 1;
+        double x = (double)current_x * old_height / (double)height;
+        double y = (double)current_y * old_width / (double)width;
+        double q11 = source_matrix[old_x * old_width + old_y];
+        double q12 = source_matrix[old_x * old_width + old_y + 1];
+        double q21 = source_matrix[(old_x + 1) * old_width + old_y];
+        double q22 = source_matrix[(old_x + 1) * old_width + old_y + 1];
+        double f_x_y1 = (x2 - x)/(x2 - x1) * q11 + (x - x1)/(x2 - x1) * q21;
+        double f_x_y2 = (x2 - x)/(x2 - x1) * q12 + (x - x1)/(x2 - x1) * q22;
+        result_matrix[current_x * width + current_y] = (y2 - y)/(y2 - y1) * f_x_y1 + (y - y1)/(y2 - y1) * f_x_y2;
     }
 }
 
-image_info get_raster(const char* filename) {
-    GDALDataset* dataset = (GDALDataset*) GDALOpen(filename, GA_ReadOnly);
-    if (dataset == nullptr) {
-        cout << "Error while creating file\n";
-        return {};
-    }
-    print_dataset_info(dataset);
+void resize_matrix_bilinear(utype* matrix, size_t height, size_t width, utype* result_matrix, size_t desired_height, size_t desired_width) {
+    chrono::milliseconds start_time = chrono::duration_cast<chrono::milliseconds>(
+        chrono::steady_clock::now().time_since_epoch());
+    utype* source_matrix_gpu;
+    cudaMalloc(&source_matrix_gpu, height * width * sizeof(utype));
+    cudaMemcpy(source_matrix_gpu, matrix, height * width * sizeof(utype), cudaMemcpyHostToDevice);
 
-    image_info imgInfo;
-    imgInfo.width = dataset->GetRasterXSize();
-    imgInfo.height = dataset->GetRasterYSize();
-    int bandCount = dataset->GetRasterCount();
+    utype* result_matrix_gpu;
+    cudaMalloc(&result_matrix_gpu, desired_height * desired_width * sizeof(utype));
 
-    imgInfo.bands.resize(bandCount);
-    for (int i = 0; i < bandCount; ++i) {
-        GDALRasterBand* band = dataset->GetRasterBand(i + 1);
-        imgInfo.bands[i] = new utype[imgInfo.width * imgInfo.height * sizeof(utype)];
-        band->RasterIO(GF_Read, 0, 0, imgInfo.width, imgInfo.height, imgInfo.bands[i], imgInfo.width, imgInfo.height, GDT_Type, 0, 0);
-    }
+    chrono::milliseconds start_time_gpu = chrono::duration_cast<chrono::milliseconds>(
+        chrono::steady_clock::now().time_since_epoch());
+    size_t threads_per_block = min((size_t)128, desired_width);
+    bilinear<<<desired_height, threads_per_block>>>(source_matrix_gpu, height, width, result_matrix_gpu, desired_height, desired_width);
+    chrono::milliseconds end_time_gpu = chrono::duration_cast<chrono::milliseconds>(
+        chrono::steady_clock::now().time_since_epoch());
+    cout << "gpu part bilinear interpolation time: " << (end_time_gpu - start_time_gpu).count() << '\n';
 
-    GDALClose(dataset);
-    return imgInfo;
+    cudaMemcpy(result_matrix, result_matrix_gpu, desired_height * desired_width * sizeof(utype), cudaMemcpyDeviceToHost);
+
+    cudaFree(source_matrix_gpu);
+    cudaFree(result_matrix_gpu);
+    chrono::milliseconds end_time = chrono::duration_cast<chrono::milliseconds>(
+        chrono::steady_clock::now().time_since_epoch());
+    cout << "whole bilinear interpolation time: " << (end_time - start_time).count() << '\n';
 }

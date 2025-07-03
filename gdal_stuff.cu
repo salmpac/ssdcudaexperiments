@@ -1,18 +1,11 @@
-#include <gdal_priv.h>
-#include <vector>
-#include <iostream>
-
 #include "cudaproj.h"
 
-using namespace std;
-using uchar = unsigned char;
-
 void create_raster(const char* filename, image_info image) {
-    vector<uchar*> bands = image.bands;
+    vector<utype*> bands = image.bands;
     size_t width = image.width;
     size_t height = image.height;
     size_t bands_count = bands.size();
-    GDALDatasetH dataset = GDALCreate(GDALGetDriverByName("GTiff"), filename, width, height, bands_count, GDT_Byte, NULL);
+    GDALDatasetH dataset = GDALCreate(GDALGetDriverByName("GTiff"), filename, width, height, bands_count, GDT_Type, NULL);
     if (dataset == NULL) {
         cout << "Error while creating file\n";
         return;
@@ -21,7 +14,7 @@ void create_raster(const char* filename, image_info image) {
     // pretty dumb
     for (size_t i = 1; i <= bands_count; ++i) {
         GDALRasterBandH band = GDALGetRasterBand(dataset, i);
-        GDALRasterIO(band, GF_Write, 0, 0, width, height, image.bands[i - 1], width, height, GDT_Byte, 0, 0);
+        GDALRasterIO(band, GF_Write, 0, 0, width, height, image.bands[i - 1], width, height, GDT_Type, 0, 0);
     }
     GDALClose(dataset);
 }
@@ -81,8 +74,8 @@ image_info get_raster(const char* filename) {
     imgInfo.bands.resize(bandCount);
     for (int i = 0; i < bandCount; ++i) {
         GDALRasterBand* band = dataset->GetRasterBand(i + 1);
-        imgInfo.bands[i] = new uchar[imgInfo.width * imgInfo.height];
-        band->RasterIO(GF_Read, 0, 0, imgInfo.width, imgInfo.height, imgInfo.bands[i], imgInfo.width, imgInfo.height, GDT_Byte, 0, 0);
+        imgInfo.bands[i] = new utype[imgInfo.width * imgInfo.height * sizeof(utype)];
+        band->RasterIO(GF_Read, 0, 0, imgInfo.width, imgInfo.height, imgInfo.bands[i], imgInfo.width, imgInfo.height, GDT_Type, 0, 0);
     }
 
     GDALClose(dataset);
