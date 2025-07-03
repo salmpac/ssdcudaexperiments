@@ -6,7 +6,7 @@ project(cudaproject LANGUAGES CXX CUDA)
 
 find_package(GDAL REQUIRED)
 
-add_executable(cudaproject main.cu gdal_stuff.cu nearest_value_interpolation.cu)
+add_executable(cudaproject gdal_stuff.cu interpolations.cu main.cu)
 
 target_link_libraries(cudaproject ${GDAL_LIBRARIES})
 
